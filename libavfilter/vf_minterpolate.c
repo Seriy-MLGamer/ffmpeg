@@ -1,6 +1,7 @@
 /**
  * Copyright (c) 2014-2015 Michael Niedermayer <michaelni@gmx.at>
  * Copyright (c) 2016 Davinder Singh (DSM_) <ds.mudhar<@gmail.com>
+ * Copyright (c) 2023 Серый MLGamer <Seriy-MLGamer@yandex.ru>
  *
  * This file is part of FFmpeg.
  *
@@ -165,7 +166,11 @@ typedef struct Frame {
 typedef struct MIContext {
     const AVClass *class;
     AVMotionEstContext me_ctx;
+    AVFrame *avf_out; /**Especially useful at min interpolation where an output frame is made from multiple input frames.*/
     AVRational frame_rate;
+    int64_t out_duration; /**Duration of an output frame in input time base.*/
+    int64_t min_duration; /**Sum of input frames durations in min interpolation. Input time base.*/
+    int64_t min_right_duration; /**Duration of the right part of an input frame between two output frames in min interpolation. Input time base.*/
     enum MIMode mi_mode;
     int mc_mode;
     int me_mode;
@@ -175,6 +180,7 @@ typedef struct MIContext {
     int vsbmc;
 
     Frame frames[NB_FRAMES];
+    int *min_buffer[AV_NUM_DATA_POINTERS]; /**For precise min interpolation.*/
     Cluster clusters[NB_CLUSTERS];
     Block *int_blocks;
     PixelMVS *pixel_mvs;
@@ -1066,7 +1072,10 @@ static void bilateral_obmc(MIContext *mi_ctx, Block *block, int mb_x, int mb_y, 
     }
 }
 
-static void interpolate(AVFilterLink *inlink, AVFrame *avf_out)
+/**
+ * Processes mag type of interpolation where output FPS is higher than input FPS.
+ */
+static inline void interpolate_mag(AVFilterLink *inlink, AVFrame *avf_out)
 {
     AVFilterContext *ctx = inlink->dst;
     AVFilterLink *outlink = ctx->outputs[0];
@@ -1149,6 +1158,69 @@ static void interpolate(AVFilterLink *inlink, AVFrame *avf_out)
     }
 }
 
+/**
+ * Processes min type of interpolation where output FPS is lower than input FPS.
+ */
+static inline void interpolate_min(AVFilterLink *inlink, AVFrame *avf_out)
+{
+    AVFilterContext *ctx = inlink->dst;
+    MIContext *mi_ctx = ctx->priv;
+    AVFrame *avf_in = mi_ctx->frames[0].avf;
+    int x, y;
+    int plane, alpha;
+    char first, last = 0;
+
+    switch(mi_ctx->mi_mode) {
+        case MI_MODE_BLEND:
+            first = !mi_ctx->min_duration;
+            if (first && mi_ctx->min_right_duration) {
+                if (mi_ctx->out_duration > mi_ctx->min_right_duration) {
+                    alpha = mi_ctx->min_right_duration * ALPHA_MAX / avf_in->duration;
+                    mi_ctx->min_duration += mi_ctx->min_right_duration;
+                } else {
+                    alpha = mi_ctx->out_duration * ALPHA_MAX / avf_in->duration;
+                    mi_ctx->min_right_duration -= mi_ctx->out_duration;
+                    mi_ctx->min_duration = 0;
+                    last = 1;
+                }
+            } else if (mi_ctx->out_duration - mi_ctx->min_duration > avf_in->duration) {
+                alpha = ALPHA_MAX;
+                mi_ctx->min_duration += avf_in->duration;
+            } else {
+                alpha = (mi_ctx->out_duration - mi_ctx->min_duration) * ALPHA_MAX / avf_in->duration;
+                mi_ctx->min_right_duration = avf_in->duration + mi_ctx->min_duration - mi_ctx->out_duration;
+                mi_ctx->min_duration = 0;
+                last = 1;
+            }
+
+            for (plane = 0; plane < mi_ctx->nb_planes; plane++) {
+                int width = avf_out->width;
+                int height = avf_out->height;
+                int *min_buffer = mi_ctx->min_buffer[plane];
+                uint8_t *data = avf_out->data[plane];
+
+                if (plane == 1 || plane == 2) {
+                    width = AV_CEIL_RSHIFT(width, mi_ctx->log2_chroma_w);
+                    height = AV_CEIL_RSHIFT(height, mi_ctx->log2_chroma_h);
+                }
+
+                if (first)
+                    for (y = 0; y < height; y++)
+                        for (x = 0; x < width; x++)
+                            min_buffer[x + y * width] = avf_in->data[plane][x + y * avf_in->linesize[plane]] * alpha;
+                else
+                    for (y = 0; y < height; y++)
+                        for (x = 0; x < width; x++)
+                            min_buffer[x + y * width] += avf_in->data[plane][x + y * avf_in->linesize[plane]] * alpha;
+                
+                if (last)
+                    for (y = 0; y < height; y++)
+                        for (x = 0; x < width; x++)
+                            data[x + y * avf_out->linesize[plane]] = min_buffer[x + y * width] * avf_in->duration / (mi_ctx->out_duration * ALPHA_MAX);
+            }
+    }
+}
+
 static int filter_frame(AVFilterLink *inlink, AVFrame *avf_in)
 {
     AVFilterContext *ctx = inlink->dst;
@@ -1161,40 +1233,85 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *avf_in)
         return ret;
     }
 
-    if (!mi_ctx->frames[NB_FRAMES - 1].avf || avf_in->pts < mi_ctx->frames[NB_FRAMES - 1].avf->pts) {
-        av_log(ctx, AV_LOG_VERBOSE, "Initializing out pts from input pts %"PRId64"\n", avf_in->pts);
-        mi_ctx->out_pts = av_rescale_q(avf_in->pts, inlink->time_base, outlink->time_base);
-    }
+    if (mi_ctx->mi_mode == MI_MODE_BLEND && av_cmp_q(inlink->frame_rate, mi_ctx->frame_rate) > 0) {
+        if (!mi_ctx->frames[0].avf || avf_in->pts < mi_ctx->frames[0].avf->pts) {
+            av_log(ctx, AV_LOG_VERBOSE, "Initializing out pts from input pts %"PRId64"\n", avf_in->pts);
+            mi_ctx->out_pts = av_rescale_q(avf_in->pts, inlink->time_base, outlink->time_base);
+            mi_ctx->min_duration = 0;
+            mi_ctx->min_right_duration = 0;
+        }
 
-    if (!mi_ctx->frames[NB_FRAMES - 1].avf)
-        if (ret = inject_frame(inlink, av_frame_clone(avf_in)))
+        av_frame_free(&mi_ctx->frames[0].avf);
+        mi_ctx->frames[0].avf = avf_in;
+
+        remainder:
+        if (!mi_ctx->min_duration) {
+            if (!(mi_ctx->avf_out = ff_get_video_buffer(ctx->outputs[0], inlink->w, inlink->h)))
+                return AVERROR(ENOMEM);
+
+            av_frame_copy_props(mi_ctx->avf_out, mi_ctx->frames[0].avf);
+            mi_ctx->avf_out->pts = mi_ctx->out_pts++;
+            mi_ctx->avf_out->duration = 1;
+            mi_ctx->out_duration = av_rescale_q(mi_ctx->out_pts, outlink->time_base, inlink->time_base) - av_rescale_q(mi_ctx->out_pts-1, outlink->time_base, inlink->time_base);
+
+            if (!mi_ctx->min_buffer[0]) {
+                for (int plane = 0; plane < mi_ctx->nb_planes; plane++) {
+                    int width = mi_ctx->avf_out->width;
+                    int height = mi_ctx->avf_out->height;
+
+                    if (plane == 1 || plane == 2) {
+                        width = AV_CEIL_RSHIFT(width, mi_ctx->log2_chroma_w);
+                        height = AV_CEIL_RSHIFT(height, mi_ctx->log2_chroma_h);
+                    }
+
+                    mi_ctx->min_buffer[plane] = av_malloc(width * height * sizeof(*mi_ctx->min_buffer[0]));
+                }
+            }
+        }
+
+        interpolate_min(inlink, mi_ctx->avf_out);
+
+        if (!mi_ctx->min_duration) {
+            if ((ret = ff_filter_frame(ctx->outputs[0], mi_ctx->avf_out)) < 0)
+                return ret;
+
+            if (mi_ctx->min_right_duration)
+                goto remainder;
+        }
+    } else {
+        if (!mi_ctx->frames[NB_FRAMES - 1].avf || avf_in->pts < mi_ctx->frames[NB_FRAMES - 1].avf->pts) {
+            av_log(ctx, AV_LOG_VERBOSE, "Initializing out pts from input pts %"PRId64"\n", avf_in->pts);
+            mi_ctx->out_pts = av_rescale_q(avf_in->pts, inlink->time_base, outlink->time_base);
+        }
+
+        if (!mi_ctx->frames[NB_FRAMES - 1].avf)
+            if (ret = inject_frame(inlink, av_frame_clone(avf_in)))
+                return ret;
+
+        if (ret = inject_frame(inlink, avf_in))
             return ret;
 
-    if (ret = inject_frame(inlink, avf_in))
-        return ret;
+        if (!mi_ctx->frames[0].avf)
+            return 0;
 
-    if (!mi_ctx->frames[0].avf)
-        return 0;
+        mi_ctx->scene_changed = detect_scene_change(ctx);
 
-    mi_ctx->scene_changed = detect_scene_change(ctx);
+        for (;;) {
+            if (av_compare_ts(mi_ctx->out_pts, outlink->time_base, mi_ctx->frames[2].avf->pts, inlink->time_base) > 0)
+                break;
 
-    for (;;) {
-        AVFrame *avf_out;
+            if (!(mi_ctx->avf_out = ff_get_video_buffer(ctx->outputs[0], inlink->w, inlink->h)))
+                return AVERROR(ENOMEM);
 
-        if (av_compare_ts(mi_ctx->out_pts, outlink->time_base, mi_ctx->frames[2].avf->pts, inlink->time_base) > 0)
-            break;
+            av_frame_copy_props(mi_ctx->avf_out, mi_ctx->frames[NB_FRAMES - 1].avf);
+            mi_ctx->avf_out->pts = mi_ctx->out_pts++;
+            mi_ctx->avf_out->duration = 1;
 
-        if (!(avf_out = ff_get_video_buffer(ctx->outputs[0], inlink->w, inlink->h)))
-            return AVERROR(ENOMEM);
+            interpolate_mag(inlink, mi_ctx->avf_out);
 
-        av_frame_copy_props(avf_out, mi_ctx->frames[NB_FRAMES - 1].avf);
-        avf_out->pts = mi_ctx->out_pts++;
-        avf_out->duration = 1;
-
-        interpolate(inlink, avf_out);
-
-        if ((ret = ff_filter_frame(ctx->outputs[0], avf_out)) < 0)
-            return ret;
+            if ((ret = ff_filter_frame(ctx->outputs[0], mi_ctx->avf_out)) < 0)
+                return ret;
+        }
     }
 
     return 0;
@@ -1213,6 +1330,8 @@ static av_cold void uninit(AVFilterContext *ctx)
     MIContext *mi_ctx = ctx->priv;
     int i, m;
 
+    av_frame_free(&mi_ctx->avf_out);
+
     av_freep(&mi_ctx->pixel_mvs);
     av_freep(&mi_ctx->pixel_weights);
     av_freep(&mi_ctx->pixel_refs);
@@ -1226,6 +1345,9 @@ static av_cold void uninit(AVFilterContext *ctx)
         av_freep(&frame->blocks);
         av_frame_free(&frame->avf);
     }
+
+    for (i = 0; i < mi_ctx->nb_planes; i++)
+        av_freep(&mi_ctx->min_buffer[i]);
 
     for (i = 0; i < 3; i++)
         av_freep(&mi_ctx->mv_table[i]);
